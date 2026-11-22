@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ZapretHub.App/ZapretHub.App.csproj" />
+    <Project Path="src/ZapretHub.Core/ZapretHub.Core.csproj" />
+    <Project Path="src/ZapretHub.Windows/ZapretHub.Windows.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ZapretHub.Tests/ZapretHub.Tests.csproj" />
+  </Folder>
+</Solution>
