@@ -4,13 +4,30 @@ public sealed class HttpConnectivity(HttpClient client, TimeSpan timeout, TimePr
 {
     public async Task<Health> CheckAsync(HubSettings settings, CancellationToken cancellationToken)
     {
-        Task<bool> control = IsControlReachableAsync(settings, cancellationToken);
-        Task<bool>[] targets = settings.Targets.Select(url => ProbeAsync(url, cancellationToken)).ToArray();
-        bool reachable = await control.ConfigureAwait(false);
-        bool[] results = await Task.WhenAll(targets).ConfigureAwait(false);
-        if (results.All(success => success))
+        using var controlStop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        using var targetsStop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        Task<bool> control = IsControlReachableAsync(settings, controlStop.Token);
+        Task<bool>[] targets = settings.Targets.Select(url => ProbeAsync(url, targetsStop.Token)).ToArray();
+        try
+        {
+            await foreach (Task<bool> finished in Task.WhenEach(targets).ConfigureAwait(false))
+            {
+                if (!await finished.ConfigureAwait(false))
+                {
+                    await targetsStop.CancelAsync().ConfigureAwait(false);
+                    return await control.ConfigureAwait(false) ? Health.TargetUnavailable : Health.NetworkUnavailable;
+                }
+            }
             return Health.Available;
-        return reachable ? Health.TargetUnavailable : Health.NetworkUnavailable;
+        }
+        finally
+        {
+            await controlStop.CancelAsync().ConfigureAwait(false);
+            await targetsStop.CancelAsync().ConfigureAwait(false);
+            // Finish canceled requests before the caller can replace the running strategy.
+            try { await Task.WhenAll(targets.Append(control)).ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
     }
 
     public Task<bool> IsControlReachableAsync(HubSettings settings, CancellationToken cancellationToken) =>

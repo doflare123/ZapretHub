@@ -4,5 +4,6 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../ZapretHub.Core/ZapretHub.Core.csproj" />
+    <InternalsVisibleTo Include="ZapretHub.Tests" />
   </ItemGroup>
 </Project>

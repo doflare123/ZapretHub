@@ -6,13 +6,15 @@ namespace ZapretHub.App;
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
+        bool startInTray = args.Contains(WindowsStartup.TrayArgument, StringComparer.Ordinal);
         using var instance = new Mutex(true, @"Local\ZapretHub", out bool firstInstance);
         if (!firstInstance)
         {
-            MessageBox.Show("ZapretHub уже запущен. Откройте его из области уведомлений.", "ZapretHub");
+            if (!startInTray)
+                MessageBox.Show("ZapretHub уже запущен. Откройте его из области уведомлений.", "ZapretHub");
             return;
         }
 
@@ -36,7 +38,15 @@ internal static class Program
             var vpn = new VpnFallback(new ManualVpnLauncher(), wireGuard, TimeProvider.System, TimeSpan.FromSeconds(25));
             var hub = new Hub(settings, new GitHubReleaseStore(github, Path.Combine(data, "Releases")), runner, connectivity,
                 vpn, storage, NetworkIdentity.Current, TimeProvider.System, new HubTiming());
-            using var window = new MainWindow(hub, settings, wireGuardSystem.Profiles);
+            using var window = new MainWindow(hub, settings, wireGuardSystem.Profiles, new WindowsStartup(Application.ExecutablePath));
+            if (startInTray)
+            {
+                using var context = new ApplicationContext();
+                window.FormClosed += (_, _) => context.ExitThread();
+                window.StartHidden();
+                Application.Run(context);
+                return;
+            }
             Application.Run(window);
         }
         catch (Exception error)

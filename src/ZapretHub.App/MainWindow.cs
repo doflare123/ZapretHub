@@ -1,4 +1,5 @@
 using ZapretHub.Core;
+using ZapretHub.Windows;
 
 namespace ZapretHub.App;
 
@@ -6,6 +7,7 @@ internal sealed class MainWindow : Form
 {
     private readonly Hub hub;
     private readonly Func<IReadOnlyList<string>> profiles;
+    private readonly WindowsStartup startup;
     private readonly CancellationTokenSource lifetime = new();
     private readonly NotifyIcon tray;
     private readonly ContextMenuStrip trayMenu = new();
@@ -27,11 +29,12 @@ internal sealed class MainWindow : Form
     private bool readyToClose;
     private VpnState? previousVpnState;
 
-    public MainWindow(Hub hub, HubSettings settings, Func<IReadOnlyList<string>> profiles)
+    public MainWindow(Hub hub, HubSettings settings, Func<IReadOnlyList<string>> profiles, WindowsStartup startup)
     {
         this.hub = hub;
         this.settings = settings;
         this.profiles = profiles;
+        this.startup = startup;
         Text = "ZapretHub";
         Icon = SystemIcons.Shield;
         Font = new Font("Segoe UI", 10);
@@ -78,11 +81,19 @@ internal sealed class MainWindow : Form
         hub.StatusChanged += UpdateStatus;
         hub.Logged += AppendLog;
         Render(hub.Status);
-        Shown += (_, _) => run ??= Task.Run(() => hub.RunAsync(lifetime.Token));
+        Shown += (_, _) => Start();
         FormClosing += OnClosing;
         SizeChanged += (_, _) => status.MaximumSize = new Size(Math.Max(1, ClientSize.Width - 52), 0);
         status.MaximumSize = new Size(ClientSize.Width - 52, 0);
     }
+
+    public void StartHidden()
+    {
+        _ = Handle;
+        BeginInvoke(() => Start());
+    }
+
+    private void Start() => run ??= Task.Run(() => hub.RunAsync(lifetime.Token));
 
     private void ShowDashboard()
     {
@@ -93,7 +104,13 @@ internal sealed class MainWindow : Form
 
     private async Task ConfigureAsync()
     {
-        using var dialog = new SettingsWindow(settings, profiles());
+        bool? autoStart = null;
+        try { autoStart = startup.IsEnabled(); }
+        catch (Exception error) when (error is System.Runtime.InteropServices.COMException or IOException or UnauthorizedAccessException)
+        {
+            AppendLog($"Планировщик заданий: {error.Message}");
+        }
+        using var dialog = new SettingsWindow(settings, profiles(), autoStart);
         if (dialog.ShowDialog(this) != DialogResult.OK || dialog.Settings is not { } updated)
             return;
         await PerformAsync(async token =>
@@ -101,6 +118,8 @@ internal sealed class MainWindow : Form
             await hub.ApplySettingsAsync(updated, token);
             settings = updated;
             Render(hub.Status);
+            if (autoStart is bool previous && dialog.AutoStart != previous)
+                startup.SetEnabled(dialog.AutoStart);
         });
     }
 

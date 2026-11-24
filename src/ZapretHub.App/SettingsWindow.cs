@@ -11,11 +11,12 @@ internal sealed class SettingsWindow : Form
     private readonly ComboBox mode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly ComboBox profile = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly TextBox application = new() { Dock = DockStyle.Fill };
+    private readonly CheckBox autoStart = new() { Text = "Запускать ZapretHub при входе в Windows", AutoSize = true };
     private readonly Label hint = new() { AutoSize = true, MaximumSize = new Size(590, 0), ForeColor = Color.DimGray };
     private readonly Label profileLabel = new() { Text = "Туннель WireGuard", Anchor = AnchorStyles.Left, AutoSize = true };
     private readonly Label applicationLabel = new() { Anchor = AnchorStyles.Left, AutoSize = true };
 
-    public SettingsWindow(HubSettings current, IReadOnlyList<string> profiles)
+    public SettingsWindow(HubSettings current, IReadOnlyList<string> profiles, bool? startupEnabled)
     {
         Text = "Настройки ZapretHub";
         Font = new Font("Segoe UI", 10);
@@ -26,7 +27,7 @@ internal sealed class SettingsWindow : Form
         MaximizeBox = false;
         MinimizeBox = false;
 
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(18), ColumnCount = 2, RowCount = 10 };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(18), ColumnCount = 2, RowCount = 11 };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int row = 0; row < layout.RowCount; row++)
@@ -53,12 +54,18 @@ internal sealed class SettingsWindow : Form
         appPicker.Controls.Add(browse, 1, 0);
         layout.Controls.Add(applicationLabel, 0, 8);
         layout.Controls.Add(appPicker, 1, 8);
+        autoStart.Checked = startupEnabled == true;
+        autoStart.Enabled = startupEnabled.HasValue;
+        if (!startupEnabled.HasValue)
+            autoStart.Text += " (Планировщик заданий недоступен)";
+        layout.Controls.Add(autoStart, 0, 9);
+        layout.SetColumnSpan(autoStart, 2);
 
         var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, AutoSize = true };
         var save = new Button { Text = "Сохранить", AutoSize = true };
         var cancel = new Button { Text = "Отмена", DialogResult = DialogResult.Cancel, AutoSize = true };
         buttons.Controls.AddRange([save, cancel]);
-        layout.Controls.Add(buttons, 0, 9);
+        layout.Controls.Add(buttons, 0, 10);
         layout.SetColumnSpan(buttons, 2);
         AcceptButton = save;
         CancelButton = cancel;
@@ -85,6 +92,7 @@ internal sealed class SettingsWindow : Form
     }
 
     public HubSettings? Settings { get; private set; }
+    public bool AutoStart => autoStart.Checked;
 
     private void UpdateMode()
     {
