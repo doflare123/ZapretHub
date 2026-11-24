@@ -16,10 +16,12 @@ internal sealed class MainWindow : Form
     private readonly Label vpnStatus = new() { AutoSize = true, ForeColor = Color.FromArgb(72, 82, 93) };
     private readonly TextBox log = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
     private readonly Button check = new() { Text = "Проверить сейчас", AutoSize = true };
+    private readonly Button findStable = new() { Text = "Найти стабильный", AutoSize = true, Visible = false };
     private readonly Button resume = new() { Text = "Вернуться к Zapret", AutoSize = true, Enabled = false };
     private readonly Button openVpn = new() { Text = "Открыть VPN", AutoSize = true, Enabled = false };
     private readonly Button retryVpn = new() { Text = "Подключить VPN", AutoSize = true, Visible = false };
     private readonly ToolStripMenuItem menuCheck = new("Проверить сейчас");
+    private readonly ToolStripMenuItem menuFindStable = new("Найти стабильный") { Visible = false };
     private readonly ToolStripMenuItem menuResume = new("Вернуться к Zapret") { Enabled = false };
     private readonly ToolStripMenuItem menuVpn = new("Открыть VPN") { Enabled = false };
     private readonly ToolStripMenuItem menuRetry = new("Подключить VPN") { Visible = false };
@@ -56,14 +58,14 @@ internal sealed class MainWindow : Form
         rows.Controls.Add(vpnStatus);
         var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, WrapContents = true };
         var configure = new Button { Text = "Настройки", AutoSize = true };
-        buttons.Controls.AddRange([check, resume, retryVpn, openVpn, configure]);
+        buttons.Controls.AddRange([check, findStable, resume, retryVpn, openVpn, configure]);
         rows.Controls.Add(buttons);
         rows.Controls.Add(new Label { Text = "Журнал", AutoSize = true, Margin = new Padding(3, 14, 3, 4) });
         rows.Controls.Add(log);
         Controls.Add(rows);
 
         trayMenu.Items.Add("Открыть ZapretHub", null, (_, _) => ShowDashboard());
-        trayMenu.Items.AddRange([menuCheck, menuResume, menuRetry, menuVpn, new ToolStripSeparator()]);
+        trayMenu.Items.AddRange([menuCheck, menuFindStable, menuResume, menuRetry, menuVpn, new ToolStripSeparator()]);
         trayMenu.Items.Add("Выход", null, async (_, _) => await ExitAsync());
         tray = new NotifyIcon { Icon = Icon, Text = "ZapretHub", ContextMenuStrip = trayMenu, Visible = true };
         tray.DoubleClick += (_, _) => ShowDashboard();
@@ -71,6 +73,8 @@ internal sealed class MainWindow : Form
 
         check.Click += async (_, _) => await PerformAsync(hub.CheckNowAsync);
         menuCheck.Click += async (_, _) => await PerformAsync(hub.CheckNowAsync);
+        findStable.Click += async (_, _) => await FindStableAsync();
+        menuFindStable.Click += async (_, _) => await FindStableAsync();
         resume.Click += async (_, _) => await ResumeAsync();
         menuResume.Click += async (_, _) => await ResumeAsync();
         openVpn.Click += async (_, _) => await PerformAsync(hub.OpenVpnManuallyAsync);
@@ -80,6 +84,7 @@ internal sealed class MainWindow : Form
         configure.Click += async (_, _) => await ConfigureAsync();
         hub.StatusChanged += UpdateStatus;
         hub.Logged += AppendLog;
+        hub.RecoveryNotification += NotifyRecovery;
         Render(hub.Status);
         Shown += (_, _) => Start();
         FormClosing += OnClosing;
@@ -141,6 +146,16 @@ internal sealed class MainWindow : Form
         catch (Exception error) { MessageBox.Show(this, error.Message, "ZapretHub", MessageBoxButtons.OK, MessageBoxIcon.Error); }
     }
 
+    private Task FindStableAsync() => hub.Status.RecoveryRequestId is { } requestId
+        ? PerformAsync(token => hub.FindStableAsync(requestId, token)) : Task.CompletedTask;
+
+    private void NotifyRecovery(Guid requestId) => Dispatch(() =>
+    {
+        if (!settings.AutoRecover && hub.Status.RecoveryRequestId == requestId)
+            tray.ShowBalloonTip(6000, "ZapretHub", "Обход нестабилен. Откройте ZapretHub и нажмите «Найти стабильный».",
+                ToolTipIcon.Warning);
+    });
+
     private void UpdateStatus(HubStatus value) => Dispatch(() => Render(value));
 
     private void Render(HubStatus value)
@@ -154,6 +169,8 @@ internal sealed class MainWindow : Form
         vpnStatus.Text = $"Резервный VPN · {selected}";
         bool vpn = value.State == HubState.Vpn;
         check.Enabled = menuCheck.Enabled = !vpn && value.State is not (HubState.Starting or HubState.Recovering or HubState.Checking);
+        findStable.Visible = menuFindStable.Visible = !settings.AutoRecover && value.State == HubState.AwaitingRecovery
+            && value.RecoveryRequestId is not null;
         resume.Enabled = menuResume.Enabled = vpn && value.Vpn?.State != VpnState.Connecting;
         retryVpn.Visible = menuRetry.Visible = vpn && settings.Vpn.Mode == VpnMode.Automatic
             && value.Vpn?.State is VpnState.Failed or VpnState.NotConfigured or VpnState.Unknown;
@@ -162,7 +179,7 @@ internal sealed class MainWindow : Form
         string tip = $"ZapretHub · {value.Strategy?.Name ?? (vpn ? "VPN" : "мониторинг")}";
         tray.Text = tip.Length > 63 ? tip[..63] : tip;
         VpnState? currentVpnState = value.Vpn?.State;
-        if (currentVpnState != previousVpnState && currentVpnState is VpnState.WaitingForUser or VpnState.Failed or VpnState.NotConfigured)
+        if (!settings.AutoRecover && currentVpnState != previousVpnState && currentVpnState is VpnState.WaitingForUser or VpnState.Failed or VpnState.NotConfigured)
             tray.ShowBalloonTip(5000, "ZapretHub", value.Message, ToolTipIcon.Warning);
         previousVpnState = currentVpnState;
     }
@@ -217,6 +234,7 @@ internal sealed class MainWindow : Form
         {
             hub.StatusChanged -= UpdateStatus;
             hub.Logged -= AppendLog;
+            hub.RecoveryNotification -= NotifyRecovery;
             tray.Dispose();
             trayMenu.Dispose();
             lifetime.Dispose();

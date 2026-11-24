@@ -40,6 +40,20 @@ public sealed class WindowsAndStateTests
     }
 
     [Fact]
+    public void ExistingSettingsRequireApprovalUntilAutomaticRecoveryIsExplicitlyEnabled()
+    {
+        using var directory = new TestDirectory();
+        File.WriteAllText(Path.Combine(directory.Path, "settings.json"), """{"KeepVersions":3}""");
+        var storage = new LocalState(directory.Path);
+
+        HubSettings old = storage.LoadSettings();
+        Assert.False(old.AutoRecover);
+        Assert.Equal(3, old.KeepVersions);
+        storage.SaveSettings(old with { AutoRecover = true });
+        Assert.True(storage.LoadSettings().AutoRecover);
+    }
+
+    [Fact]
     public async Task WindowsJobStopsRealChildAfterTheLauncherHasExited()
     {
         using var directory = new TestDirectory();

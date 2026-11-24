@@ -12,6 +12,7 @@ internal sealed class SettingsWindow : Form
     private readonly ComboBox profile = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly TextBox application = new() { Dock = DockStyle.Fill };
     private readonly CheckBox autoStart = new() { Text = "Запускать ZapretHub при входе в Windows", AutoSize = true };
+    private readonly CheckBox autoRecover = new() { Text = "Автоматически подбирать конфиг при сбое", AutoSize = true };
     private readonly Label hint = new() { AutoSize = true, MaximumSize = new Size(590, 0), ForeColor = Color.DimGray };
     private readonly Label profileLabel = new() { Text = "Туннель WireGuard", Anchor = AnchorStyles.Left, AutoSize = true };
     private readonly Label applicationLabel = new() { Anchor = AnchorStyles.Left, AutoSize = true };
@@ -27,7 +28,7 @@ internal sealed class SettingsWindow : Form
         MaximizeBox = false;
         MinimizeBox = false;
 
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(18), ColumnCount = 2, RowCount = 11 };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(18), ColumnCount = 2, RowCount = 12 };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         for (int row = 0; row < layout.RowCount; row++)
@@ -60,12 +61,15 @@ internal sealed class SettingsWindow : Form
             autoStart.Text += " (Планировщик заданий недоступен)";
         layout.Controls.Add(autoStart, 0, 9);
         layout.SetColumnSpan(autoStart, 2);
+        autoRecover.Checked = current.AutoRecover;
+        layout.Controls.Add(autoRecover, 0, 10);
+        layout.SetColumnSpan(autoRecover, 2);
 
         var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Fill, AutoSize = true };
         var save = new Button { Text = "Сохранить", AutoSize = true };
         var cancel = new Button { Text = "Отмена", DialogResult = DialogResult.Cancel, AutoSize = true };
         buttons.Controls.AddRange([save, cancel]);
-        layout.Controls.Add(buttons, 0, 10);
+        layout.Controls.Add(buttons, 0, 11);
         layout.SetColumnSpan(buttons, 2);
         AcceptButton = save;
         CancelButton = cancel;
@@ -117,6 +121,7 @@ internal sealed class SettingsWindow : Form
             {
                 KeepVersions = (int)versions.Value,
                 MonitorMinutes = (int)minutes.Value,
+                AutoRecover = autoRecover.Checked,
                 ControlUrl = new Uri(control.Text.Trim(), UriKind.Absolute),
                 Targets = targets.Lines.Where(line => !string.IsNullOrWhiteSpace(line))
                     .Select(line => new Uri(line.Trim(), UriKind.Absolute)).ToArray(),

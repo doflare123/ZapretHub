@@ -37,7 +37,7 @@ internal static class Program
                 token => connectivity.IsControlReachableAsync(storage.LoadSettings(), token), TimeProvider.System);
             var vpn = new VpnFallback(new ManualVpnLauncher(), wireGuard, TimeProvider.System, TimeSpan.FromSeconds(25));
             var hub = new Hub(settings, new GitHubReleaseStore(github, Path.Combine(data, "Releases")), runner, connectivity,
-                vpn, storage, NetworkIdentity.Current, TimeProvider.System, new HubTiming());
+                vpn, storage, NetworkIdentity.Current, TimeProvider.System, new HubTiming(), new EgorikRecoveryApproval());
             using var window = new MainWindow(hub, settings, wireGuardSystem.Profiles, new WindowsStartup(Application.ExecutablePath));
             if (startInTray)
             {

@@ -1,9 +1,9 @@
 namespace ZapretHub.Core;
 
-public enum HubState { Starting, Checking, Recovering, Zapret, NetworkUnavailable, Vpn, Error }
+public enum HubState { Starting, Checking, AwaitingRecovery, Recovering, Zapret, NetworkUnavailable, Vpn, Error }
 
 public sealed record HubStatus(HubState State, string Message, StrategyId? Strategy = null,
-    DateTimeOffset? CheckedAt = null, VpnResult? Vpn = null);
+    DateTimeOffset? CheckedAt = null, VpnResult? Vpn = null, Guid? RecoveryRequestId = null);
 
 public sealed record HubTiming
 {
@@ -24,6 +24,7 @@ public sealed class Hub
     private readonly Func<string> currentNetwork;
     private readonly TimeProvider clock;
     private readonly HubTiming timing;
+    private readonly IRecoveryApproval? approval;
     private readonly SemaphoreSlim operation = new(1);
     private readonly StrategyHistory history;
     private HubSettings settings;
@@ -33,9 +34,12 @@ public sealed class Hub
     private DateTimeOffset nextUpdate = DateTimeOffset.MinValue;
     private DateTimeOffset nextMonitor = DateTimeOffset.MinValue;
     private DateTimeOffset? checkedAt;
+    private Guid? recoveryRequestId;
+    private CancellationTokenSource? approvalCancellation;
 
     public Hub(HubSettings settings, IReleaseStore releases, IStrategyRunner runner, IConnectivity connectivity,
-        VpnFallback vpn, LocalState storage, Func<string> currentNetwork, TimeProvider clock, HubTiming timing)
+        VpnFallback vpn, LocalState storage, Func<string> currentNetwork, TimeProvider clock, HubTiming timing,
+        IRecoveryApproval? approval = null)
     {
         this.settings = settings;
         this.releases = releases;
@@ -46,6 +50,7 @@ public sealed class Hub
         this.currentNetwork = currentNetwork;
         this.clock = clock;
         this.timing = timing;
+        this.approval = approval;
         history = storage.LoadHistory();
         fallbackSettings = storage.LoadFallback();
         pausedForVpn = fallbackSettings is not null;
@@ -53,6 +58,7 @@ public sealed class Hub
 
     public event Action<HubStatus>? StatusChanged;
     public event Action<string>? Logged;
+    public event Action<Guid>? RecoveryNotification;
 
     public HubStatus Status { get; private set; } = new(HubState.Starting, "Запуск ZapretHub…");
 
@@ -69,12 +75,19 @@ public sealed class Hub
         finally
         {
             await operation.WaitAsync().ConfigureAwait(false);
-            try { await StopStrategyAsync().ConfigureAwait(false); }
+            try
+            {
+                ClearRecoveryRequest();
+                await StopStrategyAsync().ConfigureAwait(false);
+            }
             finally { operation.Release(); }
         }
     }
 
     public Task CheckNowAsync(CancellationToken cancellationToken) => ExecuteAsync(MonitorAsync, cancellationToken);
+
+    public Task FindStableAsync(Guid requestId, CancellationToken cancellationToken) =>
+        ExecuteAsync(token => ConfirmRecoveryAsync(requestId, token), cancellationToken, wait: true);
 
     public async Task ApplySettingsAsync(HubSettings newSettings, CancellationToken cancellationToken)
     {
@@ -84,6 +97,12 @@ public sealed class Hub
             storage.SaveSettings(newSettings);
             settings = newSettings;
             nextMonitor = clock.GetUtcNow().AddMinutes(settings.MonitorMinutes);
+            if (settings.AutoRecover && recoveryRequestId is not null)
+            {
+                ClearRecoveryRequest();
+                nextMonitor = clock.GetUtcNow();
+                Set(HubState.AwaitingRecovery, "Автоподбор включён. Ожидание следующей проверки…");
+            }
             Prune();
         }
         finally { operation.Release(); }
@@ -162,9 +181,17 @@ public sealed class Hub
         if (pausedForVpn)
             return;
         nextMonitor = clock.GetUtcNow().AddMinutes(settings.MonitorMinutes);
-        if (active is null || !runner.IsRunning)
+        if (active is null)
         {
             await RecoverAsync(null, checkNetwork: true, failed: null, token).ConfigureAwait(false);
+            return;
+        }
+        if (!runner.IsRunning)
+        {
+            if (!await connectivity.IsControlReachableAsync(settings, token).ConfigureAwait(false))
+                WaitForNetwork();
+            else
+                await HandleFailureAsync(token).ConfigureAwait(false);
             return;
         }
 
@@ -179,14 +206,93 @@ public sealed class Hub
         switch (health)
         {
             case Health.Available when runner.IsRunning:
+                ClearRecoveryRequest();
                 Set(HubState.Zapret, "Zapret работает");
                 break;
             case Health.NetworkUnavailable:
                 WaitForNetwork();
                 break;
             default:
-                await RecoverAsync(null, checkNetwork: false, failed: active, token).ConfigureAwait(false);
+                await HandleFailureAsync(token).ConfigureAwait(false);
                 break;
+        }
+    }
+
+    private async Task HandleFailureAsync(CancellationToken token)
+    {
+        if (settings.AutoRecover)
+        {
+            ClearRecoveryRequest();
+            await RecoverAsync(null, checkNetwork: false, failed: runner.IsRunning ? active : null, token).ConfigureAwait(false);
+            return;
+        }
+
+        bool isNew = recoveryRequestId is null;
+        Guid requestId = recoveryRequestId ??= Guid.NewGuid();
+        Set(HubState.AwaitingRecovery, runner.IsRunning ? "Текущий обход нестабилен" : "Zapret остановился");
+        if (!isNew)
+            return;
+        if (approval is null)
+        {
+            RecoveryNotification?.Invoke(requestId);
+            return;
+        }
+
+        approvalCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
+        _ = AwaitApprovalAsync(requestId, approvalCancellation.Token, token);
+    }
+
+    private async Task AwaitApprovalAsync(Guid requestId, CancellationToken requestToken, CancellationToken lifetime)
+    {
+        try
+        {
+            RecoveryDecision decision;
+            try { decision = await approval!.RequestAsync(requestId, requestToken).ConfigureAwait(false); }
+            catch (Exception error) when (!requestToken.IsCancellationRequested)
+            {
+                Logged?.Invoke($"Egorik: {error.Message}");
+                decision = RecoveryDecision.Unavailable;
+            }
+            await ExecuteAsync(async token =>
+            {
+                if (recoveryRequestId != requestId || requestToken.IsCancellationRequested || settings.AutoRecover)
+                    return;
+                if (decision == RecoveryDecision.Approved)
+                    await ConfirmRecoveryAsync(requestId, lifetime).ConfigureAwait(false);
+                else if (decision == RecoveryDecision.Unavailable)
+                    RecoveryNotification?.Invoke(requestId);
+            }, requestToken, wait: true).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (requestToken.IsCancellationRequested || lifetime.IsCancellationRequested) { }
+    }
+
+    private async Task ConfirmRecoveryAsync(Guid requestId, CancellationToken token)
+    {
+        if (pausedForVpn || recoveryRequestId != requestId || settings.AutoRecover)
+            return;
+
+        bool running = runner.IsRunning;
+        var health = running ? await connectivity.CheckAsync(settings, token).ConfigureAwait(false)
+            : await connectivity.IsControlReachableAsync(settings, token).ConfigureAwait(false)
+                ? Health.TargetUnavailable : Health.NetworkUnavailable;
+        checkedAt = clock.GetUtcNow();
+        ClearRecoveryRequest();
+        if (health == Health.Available && runner.IsRunning)
+            Set(HubState.Zapret, "Zapret работает");
+        else if (health == Health.NetworkUnavailable)
+            WaitForNetwork();
+        else
+            await RecoverAsync(null, checkNetwork: false, failed: runner.IsRunning ? active : null, token).ConfigureAwait(false);
+    }
+
+    private void ClearRecoveryRequest()
+    {
+        recoveryRequestId = null;
+        if (approvalCancellation is { } cancellation)
+        {
+            approvalCancellation = null;
+            cancellation.Cancel();
+            cancellation.Dispose();
         }
     }
 
@@ -377,6 +483,7 @@ public sealed class Hub
 
     private void WaitForNetwork()
     {
+        ClearRecoveryRequest();
         checkedAt = clock.GetUtcNow();
         nextMonitor = checkedAt.Value + timing.MaintenanceInterval;
         Set(HubState.NetworkUnavailable, "Нет доступа к контрольному ресурсу. Ожидание сети.");
@@ -384,7 +491,7 @@ public sealed class Hub
 
     private void Set(HubState state, string message, VpnResult? result = null)
     {
-        Status = new(state, message, active, checkedAt, result);
+        Status = new(state, message, active, checkedAt, result, recoveryRequestId);
         StatusChanged?.Invoke(Status);
         if (state != HubState.Checking)
             Logged?.Invoke(message);

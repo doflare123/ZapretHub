@@ -8,6 +8,7 @@ public sealed record HubSettings
 {
     public int KeepVersions { get; init; } = 2;
     public int MonitorMinutes { get; init; } = 10;
+    public bool AutoRecover { get; init; }
     public Uri ControlUrl { get; init; } = new("https://example.com/");
     public Uri[] Targets { get; init; } = [new("https://www.youtube.com/generate_204"), new("https://discord.com/api/v10/gateway")];
     public VpnSettings Vpn { get; init; } = new();

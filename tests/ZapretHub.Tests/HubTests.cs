@@ -46,7 +46,8 @@ public sealed class HubTests
     [Fact]
     public async Task ConfirmedFailureRotatesWithoutStartingTwoStrategiesAtOnce()
     {
-        await using var fixture = new Fixture();
+        var assistant = new Approval();
+        await using var fixture = new Fixture(autoRecover: true, approval: assistant);
         fixture.Releases.Strategies.AddRange([Candidate("1.1", "first"), Candidate("1.1", "second")]);
         fixture.Start();
         await fixture.WaitForAsync(status => status.State == HubState.Zapret);
@@ -57,6 +58,124 @@ public sealed class HubTests
 
         Assert.Equal(["start:first", "stop:first", "start:second"], fixture.Runner.Events);
         Assert.Equal(new StrategyId("1.1", "second"), fixture.Storage.LoadHistory().LastWorking);
+        Assert.Empty(assistant.Requests);
+        Assert.Empty(fixture.Notifications);
+    }
+
+    [Fact]
+    public async Task DefaultModeNotifiesOnceAndOnlyTheManualActionStartsRecovery()
+    {
+        await using var fixture = new Fixture();
+        await StartWithTwoStrategiesAsync(fixture);
+
+        Guid request = await ConfirmFailureAsync(fixture);
+        Assert.Equal(request, await ConfirmFailureAsync(fixture));
+        Assert.Equal([request], fixture.Notifications);
+        Assert.Equal(["start:first"], fixture.Runner.Events);
+
+        fixture.Connectivity.Results.Enqueue(Health.TargetUnavailable);
+        await fixture.Hub.FindStableAsync(request, TestContext.Current.CancellationToken);
+
+        Assert.Equal(["start:first", "stop:first", "start:second"], fixture.Runner.Events);
+    }
+
+    [Fact]
+    public async Task AssistantCanApproveRecoveryWithoutAHubNotification()
+    {
+        var assistant = new Approval();
+        await using var fixture = new Fixture(approval: assistant);
+        await StartWithTwoStrategiesAsync(fixture);
+
+        Guid request = await ConfirmFailureAsync(fixture);
+        Assert.Equal([request], assistant.Requests);
+        Assert.Equal(["start:first"], fixture.Runner.Events);
+        fixture.Connectivity.Results.Enqueue(Health.TargetUnavailable);
+        assistant.Response.SetResult(RecoveryDecision.Approved);
+
+        await fixture.WaitForAsync(status => status is { State: HubState.Zapret, Strategy.Name: "second" });
+        Assert.Equal(["start:first", "stop:first", "start:second"], fixture.Runner.Events);
+        Assert.Empty(fixture.Notifications);
+    }
+
+    [Fact]
+    public async Task UnavailableAssistantFallsBackToOneNotificationAndKeepsTheConfig()
+    {
+        var assistant = new Approval();
+        await using var fixture = new Fixture(approval: assistant);
+        await StartWithTwoStrategiesAsync(fixture);
+
+        Guid request = await ConfirmFailureAsync(fixture);
+        assistant.Response.SetResult(RecoveryDecision.Unavailable);
+        Assert.Equal(request, await fixture.Notification.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        await ConfirmFailureAsync(fixture);
+
+        Assert.Equal([request], fixture.Notifications);
+        Assert.Equal([request], assistant.Requests);
+        Assert.Equal(["start:first"], fixture.Runner.Events);
+    }
+
+    [Fact]
+    public async Task VoiceRejectionKeepsStrategyAndDoesNotAskAgainDuringTheSameFailure()
+    {
+        var assistant = new Approval();
+        await using var fixture = new Fixture(approval: assistant);
+        await StartWithTwoStrategiesAsync(fixture);
+
+        Guid request = await ConfirmFailureAsync(fixture);
+        assistant.Response.SetResult(RecoveryDecision.Declined);
+        Assert.Equal(request, await ConfirmFailureAsync(fixture));
+
+        Assert.Equal([request], assistant.Requests);
+        Assert.Empty(fixture.Notifications);
+        Assert.Equal(["start:first"], fixture.Runner.Events);
+    }
+
+    [Fact]
+    public async Task RecoveredConnectionCancelsVoicePromptAndRejectsStaleApprovals()
+    {
+        var assistant = new Approval();
+        await using var fixture = new Fixture(approval: assistant);
+        await StartWithTwoStrategiesAsync(fixture);
+
+        Guid request = await ConfirmFailureAsync(fixture);
+        await fixture.Hub.CheckNowAsync(TestContext.Current.CancellationToken);
+        assistant.Response.SetResult(RecoveryDecision.Approved);
+        await fixture.Hub.FindStableAsync(request, TestContext.Current.CancellationToken);
+
+        Assert.True(assistant.Token.IsCancellationRequested);
+        Assert.Null(fixture.Hub.Status.RecoveryRequestId);
+        Assert.Equal(["start:first"], fixture.Runner.Events);
+    }
+
+    [Fact]
+    public async Task ApprovalRechecksTheCurrentStrategyBeforeStoppingIt()
+    {
+        var assistant = new Approval();
+        await using var fixture = new Fixture(approval: assistant);
+        await StartWithTwoStrategiesAsync(fixture);
+        await ConfirmFailureAsync(fixture);
+
+        assistant.Response.SetResult(RecoveryDecision.Approved);
+
+        await fixture.WaitForAsync(status => status.State == HubState.AwaitingRecovery);
+        await fixture.WaitForAsync(status => status.State == HubState.Zapret);
+        Assert.Equal(["start:first"], fixture.Runner.Events);
+    }
+
+    private static async Task StartWithTwoStrategiesAsync(Fixture fixture)
+    {
+        fixture.Releases.Strategies.AddRange([Candidate("1.1", "first"), Candidate("1.1", "second")]);
+        fixture.Start();
+        await fixture.WaitForAsync(status => status.State == HubState.Zapret);
+    }
+
+    private static async Task<Guid> ConfirmFailureAsync(Fixture fixture)
+    {
+        fixture.Connectivity.Results.Enqueue(Health.TargetUnavailable);
+        fixture.Connectivity.Results.Enqueue(Health.TargetUnavailable);
+        await fixture.Hub.CheckNowAsync(TestContext.Current.CancellationToken);
+        Assert.Equal(HubState.AwaitingRecovery, fixture.Hub.Status.State);
+        return Assert.IsType<Guid>(fixture.Hub.Status.RecoveryRequestId);
     }
 
     [Fact]
@@ -209,7 +328,7 @@ public sealed class HubTests
 
     private static Strategy Candidate(string version, string name) => new(new(version, name), $"{name}.bat");
 
-    private sealed class Fixture(VpnSettings? vpn = null) : IAsyncDisposable
+    private sealed class Fixture(VpnSettings? vpn = null, bool autoRecover = false, IRecoveryApproval? approval = null) : IAsyncDisposable
     {
         private readonly TestDirectory directory = new();
         private readonly Channel<HubStatus> statuses = Channel.CreateUnbounded<HubStatus>();
@@ -221,15 +340,18 @@ public sealed class HubTests
         public readonly Connectivity Connectivity = new();
         public readonly ManualClient Manual = new();
         public readonly AutomaticClient Automatic = new();
+        public readonly List<Guid> Notifications = [];
+        public readonly TaskCompletionSource<Guid> Notification = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public LocalState Storage => new(directory.Path);
         public Hub Hub { get; private set; } = null!;
 
         public void Start()
         {
-            Hub = new(new HubSettings { Vpn = vpn ?? new(Application: "vpn.exe") }, Releases, Runner, Connectivity,
+            Hub = new(new HubSettings { Vpn = vpn ?? new(Application: "vpn.exe"), AutoRecover = autoRecover }, Releases, Runner, Connectivity,
                 new(Manual, Automatic, Clock, TimeSpan.FromSeconds(25)), Storage, () => "home", Clock,
-                new() { Retry = TimeSpan.Zero });
+                new() { Retry = TimeSpan.Zero }, approval);
             Hub.StatusChanged += status => statuses.Writer.TryWrite(status);
+            Hub.RecoveryNotification += request => { Notifications.Add(request); Notification.TrySetResult(request); };
             run = Hub.RunAsync(stop.Token);
         }
 
@@ -252,6 +374,20 @@ public sealed class HubTests
                 await run.WaitAsync(TimeSpan.FromSeconds(5));
             stop.Dispose();
             directory.Dispose();
+        }
+    }
+
+    private sealed class Approval : IRecoveryApproval
+    {
+        public readonly List<Guid> Requests = [];
+        public readonly TaskCompletionSource<RecoveryDecision> Response = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public CancellationToken Token { get; private set; }
+
+        public Task<RecoveryDecision> RequestAsync(Guid requestId, CancellationToken cancellationToken)
+        {
+            Requests.Add(requestId);
+            Token = cancellationToken;
+            return Response.Task.WaitAsync(cancellationToken);
         }
     }
 
